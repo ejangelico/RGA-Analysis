@@ -11,19 +11,21 @@ from scipy.optimize import curve_fit
 import sys
 import os
 import re
-from tqdm.notebook import trange, tqdm
+import seaborn as sns
 from scipy.interpolate import interp1d
 #plt.style.use('~/evanstyle.mplstyle')
 
 
 class RGAReader:
-    def __init__(self, infile, rga_kind, points_per_amu=20, min_mass=1):
+    def __init__(self, infile, rga_kind, points_per_amu=20, min_mass=1, pump_start = None):
         self.infile = infile
         self.data = [] #each index is a new scan, with its elements being dict with timestamp and new values
         self.ppa = points_per_amu
         self.min_mass = min_mass 
         #maximum mass is assumed by how many points are in the scan and points_per_amu
         self.rga_kind = rga_kind
+        self.pump_start = pump_start #datetime of when the pump was started (not necessarily first scan start time)
+        
 
 
     def load_data(self):
@@ -31,6 +33,11 @@ class RGAReader:
             self.load_data_mks()
         else:
             self.load_data_srs()
+
+        if(self.pump_start is None):
+            self.pump_start = self.data[0]["time"]
+        else:
+            self.pump_start = datetime.strptime(self.pump_start, "%Y-%m-%d %H:%M") 
 
 
     #many scans stored in a single file. Many lines
@@ -46,9 +53,15 @@ class RGAReader:
         #load in the file reader
         f = open(self.infile, 'r')
         flines = f.readlines()
-        #header is always 0:57
-        #column line is line 56
-        columnline = flines[56] #has mass values
+        #the line with all of the masses is always 1 line after the only line
+        #that contains "Scan Data". 
+        scandata_line = None
+        for i in range(100):
+            if("Scan Data" in flines[i]):
+                scandata_line = i
+                break
+
+        columnline = flines[scandata_line + 1] #has mass values
 
         #splitting up all the garbage
         columnline = columnline.split('"')
@@ -63,12 +76,12 @@ class RGAReader:
         self.ppa = np.abs(masses[0] - masses[1])
         self.min_mass = np.min(masses)
 
-        flines = flines[57:] #the rest are individual scans
+        flines = flines[scandata_line + 2:] #the rest are individual scans
 
         datetime_format = "%m/%d/%Y %I:%M:%S %p"
-        looper = tqdm(flines)
         counter = 0
-        for event in looper:
+        for event in flines:
+            print("On scan {:d} of {:d}".format(counter, len(flines)), end='\r')
             if(len(event) < 1000):
                 #likely at the end of file, some spaces or new lines
                 continue
@@ -83,9 +96,11 @@ class RGAReader:
                 print("Something wierd happened with number of data points")
                 print(len(p))
                 print(len(masses))
+                print(self.infile)
                 continue
 
             self.data.append({"time":t, "pressures": [float(_) for _ in p], "min_amu":np.min(masses), "max_amu": np.max(masses)})
+            counter += 1
 
 
 
@@ -192,8 +207,11 @@ class RGAReader:
         other_t0 = other.data[0]["time"]
         if(my_t0 > other_t0):
             s.data = [*other.data, *self.data] #concatenation
+            s.pump_start = other.pump_start
         else:
             s.data = [*self.data, *other.data]
+            s.pump_start = self.pump_start
+        
 
         return s
 
@@ -283,9 +301,9 @@ class RGAReader:
         masses = np.linspace(e["min_amu"], e["max_amu"], len(e["pressures"]))
         ax.set_title("Scan at: " + e["time"].strftime("%b %d, %Y  %H:%M:%S"))
         if(label == None):
-            ax.plot(masses, e["pressures"])
+            ax.plot(masses, e["pressures"], linewidth=0.5)
         else:
-            ax.plot(masses, e["pressures"], label=label)
+            ax.plot(masses, e["pressures"], label=label, linewidth=0.5)
         ax.set_xlabel("M/Q (amu)")
         ax.set_ylabel("Torr")
         ax.set_yscale('log')
@@ -295,6 +313,94 @@ class RGAReader:
         ax.xaxis.set_minor_locator(ticker.MultipleLocator(1))
         ax.grid(True)
         return ax
+    
+    #picks out the value of partial pressure at the closest mass value 
+    #as a function of time throughout the dataset. Does not fit the peaks,
+    #though a function below will do that. 
+    def plot_mass_evolution(self, mass, ax=None, mintime=None, maxtime=None, duration=True, dates=True, label=None, fit=False, smoothing=False):
+        if(ax is None):
+            fig, ax = plt.subplots(figsize=(14,8))
+
+
+        ps = []
+        ts = []
+        ts_h = [] #time in hours since start
+        #in case the mass point does not lie within the data,
+        #give a window of which to say "not in data"
+        mass_exclusion = 0.5 #amu
+        for i, event in enumerate(self.data):
+            data_masses = np.linspace(event["min_amu"], event["max_amu"], len(event["pressures"]))
+            m_idx = (np.abs(np.array(data_masses) - mass)).argmin()
+            m_returned = data_masses[m_idx]
+            if(np.abs(m_returned - mass) > mass_exclusion):
+                p = None
+                continue #no data at this mass region
+            
+            p = event["pressures"][m_idx]
+            ps.append(p)
+            ts.append(event["time"])
+            ts_h.append((ts[-1] - self.pump_start).total_seconds()/3600)
+
+        if(duration and dates):
+            #make an x axis on top with date labels
+            axd = ax.twiny()
+            l = axd.plot(ts, ps)
+            l.pop().remove() #remove the line from plot
+            axd.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d\n %H:%M"))
+            axd.grid(False)
+
+        if(label is None):
+            label = str(round(m_returned, 2))
+
+        filt_n = 10 #samples filter kernel 
+
+        if(duration):
+            l = ax.plot(ts_h, ps, '.',label=label)
+            color = l[0].get_color()
+            if(smoothing):
+                ax.plot(ts_h, gaussian_filter(ps, filt_n), '-', color=color)
+            ax.set_xlabel("Hours since start")
+        else:
+            l = ax.plot(ts, ps, '.',label=label)
+            color = l[0].get_color()
+            if(smoothing):
+                ax.plot(ts, gaussian_filter(ps, filt_n), '-', color=color)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d\n %H:%M"))
+
+
+        def fitfunc(x, al, A):
+            return A*x**(-al)
+        
+        #if fitting, re-do but with a fit range
+        if(fit):
+            if(mintime is None or maxtime is None):
+                mintime = ts[0]
+                maxtime = ts[-1]
+            offset = (mintime-ts[0]).total_seconds()
+            ps_fit = []
+            ts_fit = []
+            ts_fit_s = [] #time in seconds
+            for fidx, t in enumerate(ts):
+                if(mintime <= t and maxtime >= t):
+                    ps_fit.append(ps[fidx])
+                    ts_fit.append(t)
+                    ts_fit_s.append(ts_h[fidx]*3600)
+
+
+            guess = [1, 1e-2]
+            popt, pcov = curve_fit(fitfunc, ts_fit_s, ps_fit, p0=guess)
+            ax.plot(np.array(ts_fit_s)/3600, fitfunc(np.array(ts_fit_s), *popt), '--', color=color, label="({:.2e})t^(-{:.2f})".format(popt[1], popt[0]))
+            
+
+
+
+
+        ax.set_ylabel("Torr")
+        ax.set_yscale('log')
+
+        return ax
+    
+    
 
 
 
@@ -312,11 +418,13 @@ class RGAReader:
         ts_h = [] #time in hours since start
         peakfound_masses = []
         for i, event in enumerate(self.data):
-            ts.append(event["time"])
-            ts_h.append((ts[-1] - ts[0]).total_seconds()/3600)
             p, m = self.get_peakfound_pressure(mass, i, window=window)
+            if(p is None):
+                continue #no data at this mass region
             ps.append(p)
             peakfound_masses.append(m)
+            ts.append(event["time"])
+            ts_h.append((ts[-1] - self.pump_start).total_seconds()/3600)
 
         if(duration and dates):
             #make an x axis on top with date labels
@@ -361,6 +469,8 @@ class RGAReader:
                     ts.append(event["time"])
                     ts_s.append((ts[-1] - ts[0]).total_seconds()) #seconds now
                     p, m = self.get_peakfound_pressure(mass, i, window=window)
+                    if(p is None):
+                        continue #no data at this mass region
                     ps.append(p)
                     peakfound_masses.append(m)
 
@@ -387,8 +497,10 @@ class RGAReader:
         peakfound_masses = []
         for i, event in enumerate(self.data):
             ts.append(event["time"])
-            ts_h.append((ts[-1] - ts[0]).total_seconds()/3600)
+            ts_h.append((ts[-1] - self.pump_start).total_seconds()/3600)
             p, m = self.get_peakfound_pressure(mass, i, window=window)
+            if(p is None):
+                continue #no data at this mass region
             prel, mrel = self.get_peakfound_pressure(mass_rel, i, window=window)
             ps.append(p/prel)
             peakfound_masses.append(m)
@@ -430,6 +542,10 @@ class RGAReader:
             if(mass - mass_window/2 <= m <= mass + mass_window/2):
                 ms_w.append(m)
                 ps_w.append(ps[j])
+
+        #sometimes the data has no points in that mass region, in that case, skip the point
+        if(len(ms_w) == 0):
+            return None, None
         #fig, ax = plt.subplots(figsize=(12, 8))
         #ax.plot(ms_w, ps_w)
 
@@ -465,24 +581,40 @@ class RGAReader:
 
     #min/maxtimes are range to perform fit, datetime objects
     def fit_pumpdown(self, mass, mintime, maxtime):
-        ps = []
+
+        def fitfunc(x, al, A):
+            return A*x**(-al)
+        
+        if(mintime is None or maxtime is None):
+            mintime = ts[0]
+            maxtime = ts[-1]
+        
+        ps_fit = []
+        ts_fit_s = []
         ts = []
-        ts_h = [] #time in hours since start
-        peakfound_masses = []
+        mass_exclusion = 0.5 #amu
         for i, event in enumerate(self.data):
-            if(mintime < event["time"] < maxtime):
-                ts.append(event["time"])
-                ts_s.append((ts[-1] - ts[0]).total_seconds()) #seconds now
-                p, m = self.get_peakfound_pressure(mass, i, window=window)
-                prel, mrel = self.get_peakfound_pressure(mass_rel, i, window=window)
-                ps.append(p/prel)
-                peakfound_masses.append(m)
+            data_masses = np.linspace(event["min_amu"], event["max_amu"], len(event["pressures"]))
+            m_idx = (np.abs(np.array(data_masses) - mass)).argmin()
+            m_returned = data_masses[m_idx]
+            if(np.abs(m_returned - mass) > mass_exclusion):
+                p = None
+                continue #no data at this mass region
+            
+            p = event["pressures"][m_idx]
+            ts.append(event["time"])
+            if(mintime <= ts[-1] and maxtime >= ts[-1]):
+                ps_fit.append(p)
+                ts_fit_s.append((ts[-1] - ts[0]).total_seconds())
 
-        def fitfunc(x, tau, A, b):
-            return A*np.exp(-(x-b)/tau)/tau
 
-        guess = [1e4, np.mean(ps), np.mean(ts)]
-        popt, pcov = curve_fit(fitfunc, ts_s, ps, p0=guess)
+        guess = [1, 1e-2]
+        popt, pcov = curve_fit(fitfunc, ts_fit_s, ps_fit, p0=guess)
+
+        return fitfunc, popt, pcov, min(ts_fit_s), max(ts_fit_s)
+        
+
+
 
     #plot time information about scans contained in the file
     def plot_scan_times(self, ax = None):
@@ -505,7 +637,7 @@ class RGAReader:
 
     #t in hours
     def get_idx_at_duration(self, t):
-        t0 = self.data[0]["time"] #assuming sorted. 
+        t0 = self.pump_start 
         tf = t0 + timedelta(hours=t)
         return self.get_idx_at_time(tf)
 
@@ -527,7 +659,7 @@ class RGAReader:
         ts_h = [] #time in hours since start
         for i, event in enumerate(self.data):
             ts.append(event["time"])
-            ts_h.append((ts[-1] - ts[0]).total_seconds()/3600)
+            ts_h.append((ts[-1] - self.pump_start).total_seconds()/3600)
             ps.append(self.get_total_pressure(i))
 
         if(duration and dates):
@@ -579,6 +711,8 @@ class RGAReader:
         else:  
             for m in peaks:
                 p, m_ret = self.get_peakfound_pressure(m, idx, window=2)
+                if(p is None):
+                    continue #no data at this mass region
                 if(np.abs(m - m_ret) >= 1):
                     print("Couldn't get peakvalue for {:.1f} amu because of close proximity to {:.1f} amu peak".format(m, m_ret))
                 else:
