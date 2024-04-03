@@ -314,6 +314,29 @@ class RGAReader:
         ax.grid(True)
         return ax
     
+    def get_mass_evolution(self, mass):
+        ps = []
+        ts = []
+        ts_h = [] #time in hours since start
+        #in case the mass point does not lie within the data,
+        #give a window of which to say "not in data"
+        mass_exclusion = 0.5 #amu
+        for i, event in enumerate(self.data):
+            data_masses = np.linspace(event["min_amu"], event["max_amu"], len(event["pressures"]))
+            m_idx = (np.abs(np.array(data_masses) - mass)).argmin()
+            m_returned = data_masses[m_idx]
+            if(np.abs(m_returned - mass) > mass_exclusion):
+                p = None
+                continue #no data at this mass region
+            
+            p = event["pressures"][m_idx]
+            ps.append(p)
+            ts.append(event["time"])
+            ts_h.append((ts[-1] - self.pump_start).total_seconds()/3600)
+
+        return ps, ts, ts_h
+
+
     #picks out the value of partial pressure at the closest mass value 
     #as a function of time throughout the dataset. Does not fit the peaks,
     #though a function below will do that. 
